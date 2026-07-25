@@ -9,9 +9,11 @@ import math
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
+import ssl
 import sys
 import unittest
 from unittest.mock import patch
+from urllib.error import URLError
 import zlib
 
 
@@ -314,6 +316,44 @@ class NetworkClientTests(unittest.TestCase):
             wb.fetch_cdx(BusyClient(), "example.com")
         with self.assertRaisesRegex(wb.CdxError, "valid JSON"):
             wb.fetch_cdx(BrokenClient(), "example.com")
+
+    def test_certificate_failure_points_at_the_missing_ca_bundle(self):
+        def attempt(url, **kwargs):
+            raise URLError(
+                ssl.SSLCertVerificationError(
+                    1,
+                    "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify "
+                    "failed: unable to get local issuer certificate",
+                )
+            )
+
+        client = wb.NetworkClient(
+            attempt_fn=attempt,
+            sleep_fn=lambda seconds: None,
+            random_fn=lambda: 0.0,
+        )
+        with self.assertRaises(wb.NetworkError) as caught:
+            client.get("https://example.test/", attempts=1, timeout=5)
+        message = str(caught.exception)
+        self.assertIn("CERTIFICATE_VERIFY_FAILED", message)
+        self.assertIn("Install Certificates.command", message)
+        self.assertIn("SSL_CERT_FILE", message)
+
+    def test_ordinary_network_failure_carries_no_certificate_hint(self):
+        def attempt(url, **kwargs):
+            raise OSError("connection refused")
+
+        client = wb.NetworkClient(
+            attempt_fn=attempt,
+            sleep_fn=lambda seconds: None,
+            random_fn=lambda: 0.0,
+        )
+        with self.assertRaises(wb.NetworkError) as caught:
+            client.get("https://example.test/", attempts=1, timeout=5)
+        self.assertNotIn(
+            "Install Certificates.command",
+            str(caught.exception),
+        )
 
     def test_retries_protocol_errors_and_maps_final_cdx_failure(self):
         calls = 0
@@ -1197,6 +1237,106 @@ class ResultDocumentTests(unittest.TestCase):
                 }
             },
         )
+
+
+class HumanRenderingTests(unittest.TestCase):
+    def build(self, cdx_rows, failed_indexes=()):
+        snapshots, parse_warnings = wb.parse_cdx_data(
+            [
+                ["timestamp", "statuscode", "redirect", "original"],
+                *cdx_rows,
+            ]
+        )
+        results = []
+        for index, snapshot in enumerate(snapshots):
+            if index in failed_indexes:
+                results.append(
+                    wb.failed_scan_result(snapshot, "replay timed out")
+                )
+                continue
+            result = wb.failed_scan_result(snapshot, "")
+            result.update(
+                {
+                    "error": None,
+                    "httpStatus": 200,
+                    "analyzed": True,
+                }
+            )
+            results.append(result)
+        failed = len(failed_indexes)
+        scan = {
+            "mode": "adaptive",
+            "validCaptures": len(snapshots),
+            "selected": len(results),
+            "completed": len(results) - failed,
+            "failed": failed,
+            "coveragePercent": 100.0,
+            "adaptiveCapReached": False,
+            "partial": failed > 0,
+            "results": results,
+        }
+        return wb.build_success_document(
+            "example.com",
+            snapshots,
+            parse_warnings,
+            scan,
+        )
+
+    def test_targetless_redirects_collapse_into_one_line(self):
+        document = self.build(
+            [
+                ["20200101000000", "301", "", "http://example.com/"],
+                ["20200201000000", "301", "", "http://example.com/"],
+                ["20200301000000", "302", "", "http://example.com/"],
+                [
+                    "20200401000000",
+                    "301",
+                    "https://target.test/",
+                    "http://example.com/",
+                ],
+            ]
+        )
+        rendered = wb.render_human(document)
+        self.assertNotIn("target unavailable", rendered)
+        self.assertIn("https://target.test/", rendered)
+        self.assertIn(
+            "3 CDX captures reported a redirect with no recorded target",
+            rendered,
+        )
+        # The JSON contract stays complete; only the human view collapses.
+        self.assertEqual(len(document["scan"]["redirects"]), 4)
+
+    def test_single_targetless_redirect_is_reported_in_singular(self):
+        document = self.build(
+            [["20200101000000", "301", "", "http://example.com/"]]
+        )
+        rendered = wb.render_human(document)
+        self.assertIn(
+            "1 CDX capture reported a redirect with no recorded target",
+            rendered,
+        )
+
+    def test_partial_scan_is_flagged_beside_coverage_and_risk(self):
+        document = self.build(
+            [
+                ["20200101000000", "200", "", "http://example.com/"],
+                ["20200201000000", "200", "", "http://example.com/"],
+            ],
+            failed_indexes={1},
+        )
+        rendered = wb.render_human(document)
+        self.assertIn("Status: PARTIAL", rendered)
+        self.assertIn("1 of 2 selected captures failed", rendered)
+        self.assertIn("scan incomplete", rendered)
+
+    def test_complete_scan_is_never_flagged_as_partial(self):
+        document = self.build(
+            [["20200101000000", "200", "", "http://example.com/"]]
+        )
+        rendered = wb.render_human(document)
+        self.assertNotIn("PARTIAL", rendered)
+        self.assertNotIn("scan incomplete", rendered)
+        self.assertIn("None in scanned captures", rendered)
 
 
 class CliTests(unittest.TestCase):

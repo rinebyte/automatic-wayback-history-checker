@@ -457,6 +457,23 @@ class NetworkError(RuntimeError):
     """Raised after every network attempt fails."""
 
 
+CERTIFICATE_HINT = (
+    " (no usable CA bundle: on macOS run 'Install Certificates.command' "
+    "from your Python installation, or point SSL_CERT_FILE at a bundle)"
+)
+
+
+def certificate_hint(error: object) -> str:
+    """Explains a TLS trust failure, which is a local setup problem."""
+    seen: set[int] = set()
+    while isinstance(error, BaseException) and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, ssl.SSLCertVerificationError):
+            return CERTIFICATE_HINT
+        error = getattr(error, "reason", None) or error.__cause__
+    return ""
+
+
 @dataclass(frozen=True)
 class RawResponse:
     status: int
@@ -648,7 +665,10 @@ class NetworkClient:
             last_error or "request failed", self.raw_proxy, self.proxy
         )
         route = "configured proxy" if self.proxy else "direct connection"
-        raise NetworkError(f"Wayback fetch failed via {route}: {safe}")
+        raise NetworkError(
+            f"Wayback fetch failed via {route}: {safe}"
+            f"{certificate_hint(last_error)}"
+        )
 
 
 def build_cdx_url(domain: str, endpoint: str = CDX_ENDPOINT) -> str:
@@ -1726,9 +1746,13 @@ def render_human(document: dict[str, object]) -> str:
             f"{scan['completed']} / {scan['selected']}"
         ),
         f"  Coverage: {scan['coveragePercent']:.2f}%",
-        "",
-        "Risk findings",
     ]
+    if scan["partial"]:
+        lines.append(
+            f"  Status: PARTIAL — {scan['failed']} of "
+            f"{scan['selected']} selected captures failed"
+        )
+    lines.extend(["", "Risk findings"])
     if scan["riskFindings"]:
         for finding in scan["riskFindings"]:
             lines.append(
@@ -1736,6 +1760,11 @@ def render_human(document: dict[str, object]) -> str:
                 f"{', '.join(finding['categories'])}"
             )
             lines.append(f"    {finding['archiveUrl']}")
+    elif scan["partial"]:
+        lines.append(
+            "  None in scanned captures "
+            "(scan incomplete — absence is not proof)"
+        )
     else:
         lines.append("  None in scanned captures")
     lines.extend(["", "Title changes"])
@@ -1752,11 +1781,24 @@ def render_human(document: dict[str, object]) -> str:
         )
     lines.extend(["", "Redirects"])
     if scan["redirects"]:
+        # A 3xx CDX row without a recorded target carries no information, and
+        # long domain histories produce dozens of them. Collapse to a count;
+        # the JSON document still lists every row.
+        targetless_cdx = 0
         for redirect in scan["redirects"]:
+            if redirect["source"] == "cdx" and not redirect["target"]:
+                targetless_cdx += 1
+                continue
             lines.append(
                 f"  {redirect['timestamp']} "
                 f"[{redirect['source']}]: "
                 f"{redirect['target'] or 'target unavailable'}"
+            )
+        if targetless_cdx:
+            noun = "capture" if targetless_cdx == 1 else "captures"
+            lines.append(
+                f"  {targetless_cdx} CDX {noun} reported a redirect "
+                "with no recorded target"
             )
     else:
         lines.append("  None observed")

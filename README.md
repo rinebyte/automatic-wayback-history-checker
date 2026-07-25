@@ -11,6 +11,12 @@ python3 wayback_checker.py example.com --json
 python3 wayback_checker.py example.com --full-scan
 ```
 
+Requires only the standard library, but Python must be able to verify TLS
+certificates. A python.org build on macOS ships without a CA bundle until you
+run `Install Certificates.command` from its `/Applications` folder; otherwise
+every request fails with `CERTIFICATE_VERIFY_FAILED`. `SSL_CERT_FILE` also
+works.
+
 Options:
 
 - `--json` writes one machine-readable JSON document.

@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
-from functools import partial
 import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
@@ -69,15 +68,26 @@ class ScenarioHandler(BaseHTTPRequestHandler):
 class ScenarioServer(ThreadingHTTPServer):
     daemon_threads = True
 
+    def process_request(self, request, client_address):
+        # One call per accepted TCP connection, so this counts connections
+        # rather than requests.
+        self.connections_accepted = (
+            getattr(self, "connections_accepted", 0) + 1
+        )
+        super().process_request(request, client_address)
+
 
 @contextmanager
-def scenario_server(routes, delay_fn=lambda seconds: None):
+def scenario_server(routes, delay_fn=lambda seconds: None, handle=None):
     server = ScenarioServer(
         ("127.0.0.1", 0),
         ScenarioHandler,
     )
     server.routes = routes
     server.delay_fn = delay_fn
+    server.connections_accepted = 0
+    if handle is not None:
+        handle.append(server)
     thread = threading.Thread(
         target=server.serve_forever,
         daemon=True,
@@ -251,6 +261,79 @@ def slow_routes():
     return routes
 
 
+class ConnectionReuseIntegrationTests(unittest.TestCase):
+    def test_repeated_requests_share_one_tcp_connection(self):
+        routes = {
+            "/page": [
+                (200, {"Content-Type": "text/html"}, b"<title>ok</title>", 0)
+            ]
+        }
+        handle = []
+        with scenario_server(routes, handle=handle) as base:
+            client = wb.NetworkClient(sleep_fn=lambda seconds: None)
+            self.addCleanup(client.close)
+            for _ in range(12):
+                self.assertEqual(
+                    client.get(
+                        f"{base}/page",
+                        attempts=1,
+                        timeout=5,
+                    ).status,
+                    200,
+                )
+        # Archive.org budgets new TCP connections, not requests, so a scan
+        # must not open one per capture.
+        self.assertEqual(handle[0].connections_accepted, 1)
+
+    def test_truncated_response_does_not_poison_the_pool(self):
+        routes = {
+            "/big": [(200, {"Content-Type": "text/html"}, b"x" * 500, 0)]
+        }
+        handle = []
+        with scenario_server(routes, handle=handle) as base:
+            client = wb.NetworkClient(sleep_fn=lambda seconds: None)
+            self.addCleanup(client.close)
+            first = client.get(
+                f"{base}/big",
+                attempts=1,
+                timeout=5,
+                max_wire_bytes=10,
+            )
+            self.assertTrue(first.wire_truncated)
+            self.assertEqual(len(first.body), 10)
+            # An undrained connection cannot be reused; the next request must
+            # still succeed rather than read the previous body's leftovers.
+            second = client.get(f"{base}/big", attempts=1, timeout=5)
+            self.assertEqual(second.status, 200)
+            self.assertEqual(len(second.body), 500)
+
+    def test_server_closing_the_connection_is_handled(self):
+        routes = {
+            "/once": [
+                (
+                    200,
+                    {"Content-Type": "text/html", "Connection": "close"},
+                    b"bye",
+                    0,
+                )
+            ]
+        }
+        handle = []
+        with scenario_server(routes, handle=handle) as base:
+            client = wb.NetworkClient(sleep_fn=lambda seconds: None)
+            self.addCleanup(client.close)
+            for _ in range(3):
+                self.assertEqual(
+                    client.get(
+                        f"{base}/once",
+                        attempts=1,
+                        timeout=5,
+                    ).body,
+                    b"bye",
+                )
+        self.assertEqual(handle[0].connections_accepted, 3)
+
+
 class LocalHttpIntegrationTests(unittest.TestCase):
     def test_real_urllib_retry_after_and_no_redirect_follow(self):
         future = format_datetime(
@@ -280,6 +363,7 @@ class LocalHttpIntegrationTests(unittest.TestCase):
 
         with scenario_server(routes) as base:
             client = wb.NetworkClient(sleep_fn=sleep)
+            self.addCleanup(client.close)
             self.assertEqual(
                 client.get(
                     f"{base}/seconds",
@@ -459,14 +543,14 @@ class ConnectAndInterruptIntegrationTests(unittest.TestCase):
             client = wb.NetworkClient(
                 proxy=normalized,
                 raw_proxy=raw_proxy,
-                attempt_fn=partial(
-                    wb.urllib_attempt,
+                attempt_fn=wb.PooledTransport(
                     ssl_context=client_context,
                 ),
                 sleep_fn=lambda seconds: None,
                 random_fn=lambda: 0.0,
                 verbose_fn=logs.append,
             )
+            self.addCleanup(client.close)
             with patch.dict(
                 os.environ,
                 {"NO_PROXY": "*", "no_proxy": "*"},

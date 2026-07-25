@@ -24,18 +24,10 @@ from email.message import Message
 from email.utils import parsedate_to_datetime
 from html import unescape
 from html.parser import HTMLParser
-from http.client import HTTPException
+from http.client import HTTPConnection, HTTPException, HTTPSConnection
 from typing import Any, Callable, Mapping
 import unicodedata
-from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
-from urllib.request import (
-    HTTPRedirectHandler,
-    HTTPSHandler,
-    ProxyHandler,
-    Request,
-    build_opener,
-)
 import zlib
 
 
@@ -493,86 +485,209 @@ class RawResponse:
     wire_truncated: bool
 
 
-class NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-class ExplicitProxyHandler(ProxyHandler):
-    """Proxy handler that does not consult ambient NO_PROXY rules."""
-
-    def proxy_open(self, req, proxy, proxy_scheme):
-        original_scheme = req.type
-        parsed = urlsplit(proxy)
-        selected_scheme = parsed.scheme.lower() or proxy_scheme
-        if not parsed.hostname:
-            raise OSError("configured proxy has no hostname")
-        try:
-            port = parsed.port
-        except ValueError as exc:
-            raise OSError("configured proxy has an invalid port") from exc
-        host = parsed.hostname
-        if ":" in host:
-            host = f"[{host}]"
-        hostport = f"{host}:{port}" if port is not None else host
-        if parsed.username is not None:
-            user_pass = (
-                f"{unquote(parsed.username)}:"
-                f"{unquote(parsed.password or '')}"
-            )
-            credentials = base64.b64encode(
-                user_pass.encode()
-            ).decode("ascii")
-            req.add_header(
-                "Proxy-authorization",
-                f"Basic {credentials}",
-            )
-        req.set_proxy(hostport, selected_scheme)
-        if (
-            original_scheme == selected_scheme
-            or original_scheme == "https"
-        ):
-            return None
-        return self.parent.open(req, timeout=req.timeout)
-
-
-def urllib_attempt(
-    url: str,
-    *,
-    proxy: str | None,
-    timeout: float,
-    headers: Mapping[str, str],
-    max_wire_bytes: int,
-    ssl_context: ssl.SSLContext | None = None,
-) -> RawResponse:
-    proxy_handler = (
-        ExplicitProxyHandler(
-            {"http": proxy, "https": proxy}
+def proxy_endpoint(proxy: str) -> tuple[str, int, str | None]:
+    """Splits a normalized proxy URL into host, port and Basic credentials."""
+    parsed = urlsplit(proxy)
+    if not parsed.hostname:
+        raise OSError("configured proxy has no hostname")
+    try:
+        port = parsed.port or 80
+    except ValueError as exc:
+        raise OSError("configured proxy has an invalid port") from exc
+    authorization = None
+    if parsed.username is not None:
+        user_pass = (
+            f"{unquote(parsed.username)}:"
+            f"{unquote(parsed.password or '')}"
         )
-        if proxy
-        else ProxyHandler({})
-    )
-    handlers = [proxy_handler, NoRedirect()]
-    if ssl_context is not None:
-        handlers.append(HTTPSHandler(context=ssl_context))
-    opener = build_opener(*handlers)
-    request = Request(url, method="GET", headers=dict(headers))
-    try:
-        response = opener.open(request, timeout=timeout)
-    except HTTPError as error:
-        response = error
-    try:
+        credentials = base64.b64encode(user_pass.encode()).decode("ascii")
+        authorization = f"Basic {credentials}"
+    return parsed.hostname, port, authorization
+
+
+@dataclass(frozen=True)
+class _Route:
+    connection: HTTPConnection
+    headers: dict[str, str]
+    absolute_uri: bool
+
+
+class PooledTransport:
+    """Performs GETs over connections that are kept alive per thread.
+
+    Archive.org budgets *new TCP connections* per client IP, not requests,
+    and refuses further connections for about a minute once that budget is
+    spent. Opening a connection per capture is therefore what gets a scan
+    refused; one connection per worker keeps a whole scan to a handful.
+
+    Redirects are never followed and ambient NO_PROXY rules are never
+    consulted, because http.client does neither on its own.
+    """
+
+    def __init__(self, ssl_context: ssl.SSLContext | None = None):
+        self.ssl_context = ssl_context
+        self._local = threading.local()
+        self._pools: list[dict[tuple, _Route]] = []
+        self._pools_lock = threading.Lock()
+
+    def _pool(self) -> dict[tuple, _Route]:
+        pool = getattr(self._local, "pool", None)
+        if pool is None:
+            pool = {}
+            self._local.pool = pool
+            # Registered so close() can reach connections opened by workers,
+            # which are not visible from the thread that shuts the scan down.
+            with self._pools_lock:
+                self._pools.append(pool)
+        return pool
+
+    def close(self) -> None:
+        """Closes every pooled connection, whichever thread opened it."""
+        with self._pools_lock:
+            pools = list(self._pools)
+        for pool in pools:
+            for route in list(pool.values()):
+                route.connection.close()
+            pool.clear()
+
+    def _open(
+        self,
+        scheme: str,
+        host: str,
+        port: int,
+        proxy: str | None,
+        timeout: float,
+    ) -> _Route:
+        secure = scheme == "https"
+        if not proxy:
+            if secure:
+                connection = HTTPSConnection(
+                    host,
+                    port,
+                    timeout=timeout,
+                    context=self.ssl_context,
+                )
+            else:
+                connection = HTTPConnection(host, port, timeout=timeout)
+            return _Route(connection, {}, False)
+
+        proxy_host, proxy_port, authorization = proxy_endpoint(proxy)
+        if secure:
+            # CONNECT tunnel: credentials belong to the tunnel request, and
+            # TLS is negotiated with the origin inside it.
+            connection = HTTPSConnection(
+                proxy_host,
+                proxy_port,
+                timeout=timeout,
+                context=self.ssl_context,
+            )
+            connection.set_tunnel(
+                host,
+                port,
+                headers=(
+                    {"Proxy-Authorization": authorization}
+                    if authorization
+                    else {}
+                ),
+            )
+            return _Route(connection, {}, False)
+        # Plain HTTP through a proxy uses an absolute request URI, and the
+        # credentials ride on every request instead of a tunnel.
+        connection = HTTPConnection(proxy_host, proxy_port, timeout=timeout)
+        headers = {"Host": f"{host}:{port}"}
+        if authorization:
+            headers["Proxy-Authorization"] = authorization
+        return _Route(connection, headers, True)
+
+    def _exchange(
+        self,
+        route: _Route,
+        *,
+        target: str,
+        headers: Mapping[str, str],
+        max_wire_bytes: int,
+    ) -> tuple[RawResponse, bool]:
+        request_headers = dict(headers)
+        request_headers.update(route.headers)
+        route.connection.request("GET", target, headers=request_headers)
+        response = route.connection.getresponse()
         body = response.read(max_wire_bytes + 1)
-        return RawResponse(
-            status=int(response.getcode()),
-            headers={
-                key.lower(): value for key, value in response.headers.items()
-            },
-            body=body[:max_wire_bytes],
-            wire_truncated=len(body) > max_wire_bytes,
+        truncated = len(body) > max_wire_bytes
+        # A connection whose body we stopped reading still holds unread
+        # bytes, so reusing it would splice them into the next response.
+        reusable = not truncated and not response.will_close
+        return (
+            RawResponse(
+                status=int(response.status),
+                headers={
+                    key.lower(): value
+                    for key, value in response.getheaders()
+                },
+                body=body[:max_wire_bytes],
+                wire_truncated=truncated,
+            ),
+            reusable,
         )
-    finally:
-        response.close()
+
+    def __call__(
+        self,
+        url: str,
+        *,
+        proxy: str | None,
+        timeout: float,
+        headers: Mapping[str, str],
+        max_wire_bytes: int,
+    ) -> RawResponse:
+        parsed = urlsplit(url)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"http", "https"}:
+            raise OSError(f"unsupported URL scheme: {scheme or 'none'}")
+        if not parsed.hostname:
+            raise OSError("request URL has no host")
+        port = parsed.port or (443 if scheme == "https" else 80)
+        key = (scheme, parsed.hostname, port, proxy or "")
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+
+        pool = self._pool()
+        pooled = pool.pop(key, None)
+        candidates = [pooled] if pooled is not None else []
+        candidates.append(None)
+
+        last_error: BaseException | None = None
+        for candidate in candidates:
+            route = candidate or self._open(
+                scheme,
+                parsed.hostname,
+                port,
+                proxy,
+                timeout,
+            )
+            route.connection.timeout = timeout
+            if getattr(route.connection, "sock", None) is not None:
+                route.connection.sock.settimeout(timeout)
+            try:
+                response, reusable = self._exchange(
+                    route,
+                    target=url if route.absolute_uri else target,
+                    headers=headers,
+                    max_wire_bytes=max_wire_bytes,
+                )
+            except (OSError, HTTPException) as exc:
+                route.connection.close()
+                if candidate is None:
+                    raise
+                # A pooled connection the peer had already dropped; the
+                # request never reached anyone, so retry it once fresh.
+                last_error = exc
+                continue
+            if reusable:
+                pool[key] = route
+            else:
+                route.connection.close()
+            return response
+        raise last_error or OSError("request failed")
 
 
 class NetworkClient:
@@ -581,7 +696,7 @@ class NetworkClient:
         *,
         proxy: str | None = None,
         raw_proxy: str | None = None,
-        attempt_fn: Callable[..., RawResponse] = urllib_attempt,
+        attempt_fn: Callable[..., RawResponse] | None = None,
         sleep_fn: Callable[[float], None] | None = None,
         random_fn: Callable[[], float] = random.random,
         clock_fn: Callable[[], float] = time.monotonic,
@@ -589,7 +704,7 @@ class NetworkClient:
     ):
         self.proxy = proxy
         self.raw_proxy = raw_proxy
-        self.attempt_fn = attempt_fn
+        self.attempt_fn = attempt_fn or PooledTransport()
         self.cancelled = threading.Event()
         self.sleep_fn = sleep_fn or self._interruptible_sleep
         self.random_fn = random_fn
@@ -610,6 +725,12 @@ class NetworkClient:
     def cancel(self) -> None:
         """Abandons in-flight retries; safe to call from any thread."""
         self.cancelled.set()
+
+    def close(self) -> None:
+        """Releases pooled connections held by the transport."""
+        closer = getattr(self.attempt_fn, "close", None)
+        if closer is not None:
+            closer()
 
     def _log(self, message: str) -> None:
         if self.verbose_fn:
@@ -708,12 +829,7 @@ class NetworkClient:
                     with self._lock:
                         self._proxy_preferred_until = self.clock_fn() + 60.0
                 return response
-            except (
-                OSError,
-                URLError,
-                TimeoutError,
-                HTTPException,
-            ) as exc:
+            except (OSError, TimeoutError, HTTPException) as exc:
                 last_error = exc
                 direct_failed = direct_failed or not use_proxy
                 if attempt_index + 1 >= attempts:
@@ -1918,6 +2034,7 @@ def run_cli(
     json_requested = "--json" in argv
     raw_proxy = None
     proxy = None
+    client = None
     try:
         args = build_parser().parse_args(argv)
         json_requested = bool(args.json_output)
@@ -2047,6 +2164,9 @@ def run_cli(
             )
             stderr.write(safe_trace + "\n")
         return 4
+    finally:
+        if client is not None:
+            client.close()
 
 
 def main() -> int:

@@ -1463,6 +1463,9 @@ class CliTests(unittest.TestCase):
             def cancel(self):
                 pass
 
+            def close(self):
+                pass
+
         return FakeClient()
 
     def test_json_success_is_parseable_and_quiet(self):
@@ -1497,6 +1500,9 @@ class CliTests(unittest.TestCase):
         class BusyClient:
             def get(self, url, **kwargs):
                 return wb.RawResponse(503, {}, b"busy", False)
+
+            def close(self):
+                pass
 
         busy_out, busy_err = StringIO(), StringIO()
         busy_code = wb.run_cli(

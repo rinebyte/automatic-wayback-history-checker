@@ -31,9 +31,17 @@ Supported proxies are `http://host:port`,
 `http://user:password@host:port`, `host:port`, and
 `host:port:user:password`. Credentials are redacted from output.
 
+Connections are kept alive and reused, one per worker. Archive.org budgets new
+TCP connections per client IP rather than requests, and refuses further
+connections outright — at the TCP level, not as a `503` — for about a minute
+once that budget is spent. A connection per capture is what gets a scan
+refused; measured on a 140-capture domain, a fresh connection per request lost
+20 of 39 captures, while reusing connections lost none.
+
 Requests start with a direct attempt. The configured proxy is used after a
 retryable status or network failure; after rescuing a request, it is preferred
-for 60 seconds.
+for 60 seconds. A proxy also spreads the connection budget across IPs, which
+helps if a scan is large enough to exhaust one.
 
 A `429` or `503` is treated as a request to slow down rather than a transient
 error: it starts a 10-second cooldown shared by every worker, so the whole scan

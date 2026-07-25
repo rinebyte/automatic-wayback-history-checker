@@ -33,7 +33,14 @@ Supported proxies are `http://host:port`,
 
 Requests start with a direct attempt. The configured proxy is used after a
 retryable status or network failure; after rescuing a request, it is preferred
-for 60 seconds. This is fallback routing, not an anonymity mode: a successful
+for 60 seconds.
+
+A `429` or `503` is treated as a request to slow down rather than a transient
+error: it starts a 10-second cooldown shared by every worker, so the whole scan
+backs off together instead of each thread hammering the same closed door. A
+`Retry-After` header overrides that delay, honoured up to 60 seconds. Other
+retryable statuses keep the fast exponential backoff. Ctrl-C interrupts a
+pending backoff or cooldown immediately. This is fallback routing, not an anonymity mode: a successful
 first request goes directly to Archive.org. Explicit proxy routing ignores
 ambient `NO_PROXY` settings.
 
@@ -46,8 +53,10 @@ proxy; HTTPS Archive.org traffic remains protected inside the CONNECT tunnel.
 
 Adaptive mode samples up to 20 captures, expands around risk/redirect
 findings and title transitions, and stops at 40 submitted captures. Use
-`--full-scan` when completeness is more important than runtime. A worst-case
-500-capture full scan can take roughly 100 minutes under repeated timeouts.
+`--full-scan` when completeness is more important than runtime. Each replay is
+attempted up to three times, so a worst-case 500-capture full scan can run for
+a couple of hours under repeated timeouts, and longer if Archive.org keeps
+asking for cooldowns.
 
 ## Interpretation
 

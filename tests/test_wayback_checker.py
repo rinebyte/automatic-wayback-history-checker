@@ -111,7 +111,9 @@ class ProxyAndRetryTests(unittest.TestCase):
         self.assertEqual(wb.retry_after_seconds("3", now), 3.0)
         future = format_datetime(now.replace(second=8), usegmt=True)
         self.assertEqual(wb.retry_after_seconds(future, now), 8.0)
-        self.assertEqual(wb.retry_after_seconds("99", now), 10.0)
+        self.assertEqual(wb.retry_after_seconds("45", now), 45.0)
+        # Still bounded, so a hostile or absurd header cannot stall a scan.
+        self.assertEqual(wb.retry_after_seconds("3600", now), 60.0)
         self.assertIsNone(wb.retry_after_seconds("not-a-date", now))
 
     def test_backoff_is_exponential_jittered_and_capped(self):
@@ -243,16 +245,22 @@ class NetworkClientTests(unittest.TestCase):
             wb.RawResponse(200, {}, b"again", False),
         ]
 
+        clock = [100.0]
+
         def attempt(url, *, proxy, timeout, headers, max_wire_bytes):
             calls.append(proxy)
             return responses.pop(0)
 
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
         client = wb.NetworkClient(
             proxy="http://proxy:8080",
             attempt_fn=attempt,
-            sleep_fn=sleeps.append,
+            sleep_fn=sleep,
             random_fn=lambda: 0.0,
-            clock_fn=lambda: 100.0,
+            clock_fn=lambda: clock[0],
         )
         first = client.get("https://example.test/", attempts=3, timeout=5)
         second = client.get("https://example.test/next", attempts=1, timeout=5)
@@ -316,6 +324,79 @@ class NetworkClientTests(unittest.TestCase):
             wb.fetch_cdx(BusyClient(), "example.com")
         with self.assertRaisesRegex(wb.CdxError, "valid JSON"):
             wb.fetch_cdx(BrokenClient(), "example.com")
+
+    def test_cancel_abandons_the_remaining_attempts(self):
+        calls = []
+
+        def attempt(url, **kwargs):
+            calls.append(url)
+            client.cancel()
+            raise OSError("boom")
+
+        client = wb.NetworkClient(
+            attempt_fn=attempt,
+            sleep_fn=lambda seconds: None,
+            random_fn=lambda: 0.0,
+        )
+        with self.assertRaises(wb.NetworkError):
+            client.get("https://example.test/", attempts=3, timeout=5)
+        self.assertEqual(len(calls), 1)
+
+    def test_busy_status_waits_the_cooldown_not_the_fast_backoff(self):
+        responses = [
+            wb.RawResponse(503, {}, b"busy", False),
+            wb.RawResponse(200, {}, b"ok", False),
+        ]
+        sleeps = []
+        client = wb.NetworkClient(
+            attempt_fn=lambda url, **kwargs: responses.pop(0),
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.0,
+            clock_fn=lambda: 100.0,
+        )
+        response = client.get(
+            "https://example.test/",
+            attempts=2,
+            timeout=5,
+        )
+        self.assertEqual(response.body, b"ok")
+        self.assertEqual(sleeps, [10.0])
+
+    def test_busy_cooldown_also_holds_back_a_later_request(self):
+        responses = [
+            wb.RawResponse(503, {}, b"busy", False),
+            wb.RawResponse(200, {}, b"ok", False),
+            wb.RawResponse(200, {}, b"later", False),
+        ]
+        sleeps = []
+        client = wb.NetworkClient(
+            attempt_fn=lambda url, **kwargs: responses.pop(0),
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.0,
+            clock_fn=lambda: 100.0,
+        )
+        client.get("https://example.test/a", attempts=2, timeout=5)
+        sleeps.clear()
+        # A single-attempt request that never saw a 503 still waits out the
+        # shared cooldown before its first attempt.
+        later = client.get("https://example.test/b", attempts=1, timeout=5)
+        self.assertEqual(later.body, b"later")
+        self.assertEqual(sleeps, [10.0])
+
+    def test_transient_server_error_keeps_the_fast_backoff(self):
+        responses = [
+            wb.RawResponse(500, {}, b"boom", False),
+            wb.RawResponse(200, {}, b"ok", False),
+        ]
+        sleeps = []
+        client = wb.NetworkClient(
+            attempt_fn=lambda url, **kwargs: responses.pop(0),
+            sleep_fn=sleeps.append,
+            random_fn=lambda: 0.0,
+            clock_fn=lambda: 100.0,
+        )
+        client.get("https://example.test/", attempts=2, timeout=5)
+        self.assertEqual(sleeps, [0.7])
 
     def test_certificate_failure_points_at_the_missing_ca_bundle(self):
         def attempt(url, **kwargs):
@@ -770,6 +851,23 @@ class SnapshotScanTests(unittest.TestCase):
                 return response
 
         return FakeClient()
+
+    def test_replay_fetch_gets_three_attempts(self):
+        client = self.client_returning(
+            wb.RawResponse(
+                200,
+                {"content-type": "text/html"},
+                b"<title>ok</title>",
+                False,
+            )
+        )
+        wb.scan_snapshot(
+            self.SNAPSHOT,
+            client,
+            domain="example.com",
+            custom_keywords=[],
+        )
+        self.assertEqual(client.kwargs["attempts"], 3)
 
     def test_http_redirect_does_not_analyze_body(self):
         result = wb.scan_snapshot(
@@ -1361,6 +1459,9 @@ class CliTests(unittest.TestCase):
                     b"<title>Example Domain</title>",
                     False,
                 )
+
+            def cancel(self):
+                pass
 
         return FakeClient()
 

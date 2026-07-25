@@ -271,8 +271,15 @@ class LocalHttpIntegrationTests(unittest.TestCase):
             ],
         }
         sleeps = []
+
+        def sleep(seconds):
+            # Really sleep: the busy cooldown is wall-clock based, so a fake
+            # sleep would leave it pending and stall the next request.
+            sleeps.append(seconds)
+            time.sleep(seconds)
+
         with scenario_server(routes) as base:
-            client = wb.NetworkClient(sleep_fn=sleeps.append)
+            client = wb.NetworkClient(sleep_fn=sleep)
             self.assertEqual(
                 client.get(
                     f"{base}/seconds",
@@ -299,9 +306,11 @@ class LocalHttpIntegrationTests(unittest.TestCase):
             redirect.headers["location"],
             "/target",
         )
-        self.assertEqual(sleeps[0], 0.0)
-        self.assertGreaterEqual(sleeps[1], 0.0)
-        self.assertLessEqual(sleeps[1], 3.0)
+        # "Retry-After: 0" means retry now, so it no longer books a sleep;
+        # only the future-dated header makes the client wait.
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 0.0)
+        self.assertLessEqual(sleeps[0], 3.0)
 
     def test_end_to_end_json_keeps_partial_replay_result(self):
         cdx = (

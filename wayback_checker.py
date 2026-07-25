@@ -233,6 +233,14 @@ def _redact_cli_error(
     )
 
 
+# Statuses where the server is explicitly asking us to slow down, as opposed
+# to a one-off failure worth retrying immediately.
+BUSY_STATUSES = {429, 503}
+BUSY_COOLDOWN_SECONDS = 10.0
+# Retry-After is honoured, but bounded so an absurd header cannot stall a scan.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
 def retry_after_seconds(
     value: str | None,
     now: datetime | None = None,
@@ -241,7 +249,7 @@ def retry_after_seconds(
         return None
     stripped = value.strip()
     if stripped.isdigit():
-        return min(10.0, max(0.0, float(stripped)))
+        return min(MAX_RETRY_AFTER_SECONDS, max(0.0, float(stripped)))
     try:
         parsed = parsedate_to_datetime(stripped)
     except (TypeError, ValueError, OverflowError):
@@ -249,7 +257,10 @@ def retry_after_seconds(
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     current = now or datetime.now(timezone.utc)
-    return min(10.0, max(0.0, (parsed - current).total_seconds()))
+    return min(
+        MAX_RETRY_AFTER_SECONDS,
+        max(0.0, (parsed - current).total_seconds()),
+    )
 
 
 def backoff_seconds(retry_index: int, random_value: float) -> float:
@@ -571,7 +582,7 @@ class NetworkClient:
         proxy: str | None = None,
         raw_proxy: str | None = None,
         attempt_fn: Callable[..., RawResponse] = urllib_attempt,
-        sleep_fn: Callable[[float], None] = time.sleep,
+        sleep_fn: Callable[[float], None] | None = None,
         random_fn: Callable[[], float] = random.random,
         clock_fn: Callable[[], float] = time.monotonic,
         verbose_fn: Callable[[str], None] | None = None,
@@ -579,17 +590,50 @@ class NetworkClient:
         self.proxy = proxy
         self.raw_proxy = raw_proxy
         self.attempt_fn = attempt_fn
-        self.sleep_fn = sleep_fn
+        self.cancelled = threading.Event()
+        self.sleep_fn = sleep_fn or self._interruptible_sleep
         self.random_fn = random_fn
         self.clock_fn = clock_fn
         self.verbose_fn = verbose_fn
         self._proxy_preferred_until = 0.0
+        self._busy_until = 0.0
         self._lock = threading.Lock()
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleeps, but wakes immediately once the scan is cancelled.
+
+        Worker threads never receive SIGINT, so without this a Ctrl-C would
+        block until the longest backoff or cooldown had run its course.
+        """
+        self.cancelled.wait(seconds)
+
+    def cancel(self) -> None:
+        """Abandons in-flight retries; safe to call from any thread."""
+        self.cancelled.set()
 
     def _log(self, message: str) -> None:
         if self.verbose_fn:
             self.verbose_fn(
                 redact_proxy_secrets(message, self.raw_proxy, self.proxy)
+            )
+
+    def _await_busy_window(self) -> None:
+        """Blocks while a shared 429/503 cooldown is still running.
+
+        Archive.org throttles the caller, not one request, so every worker
+        waits it out instead of spending its attempts on a closed door.
+        """
+        with self._lock:
+            remaining = self._busy_until - self.clock_fn()
+        if remaining > 0:
+            self._log(f"archive.org cooldown: waiting {remaining:.1f}s")
+            self.sleep_fn(remaining)
+
+    def _begin_busy_cooldown(self, delay: float) -> None:
+        with self._lock:
+            self._busy_until = max(
+                self._busy_until,
+                self.clock_fn() + delay,
             )
 
     def get(
@@ -609,6 +653,9 @@ class NetworkClient:
         last_error: BaseException | None = None
         direct_failed = False
         for attempt_index in range(attempts):
+            if self.cancelled.is_set():
+                raise NetworkError("Wayback fetch cancelled")
+            self._await_busy_window()
             with self._lock:
                 prefer_proxy = self.clock_fn() < self._proxy_preferred_until
             use_proxy = bool(
@@ -631,6 +678,19 @@ class NetworkClient:
                     delay = retry_after_seconds(
                         response.headers.get("retry-after")
                     )
+                    if response.status in BUSY_STATUSES:
+                        # Park every worker; the next loop does the waiting.
+                        cooldown = (
+                            delay
+                            if delay is not None
+                            else BUSY_COOLDOWN_SECONDS
+                        )
+                        self._begin_busy_cooldown(cooldown)
+                        self._log(
+                            f"status {response.status}: "
+                            f"cooling down {cooldown:.1f}s"
+                        )
+                        continue
                     if delay is None:
                         delay = backoff_seconds(
                             attempt_index, self.random_fn()
@@ -1166,7 +1226,7 @@ def scan_snapshot(
     try:
         response = client.get(
             replay_url,
-            attempts=2,
+            attempts=3,
             timeout=timeout,
             headers={"User-Agent": f"{USER_AGENT} (+archive-scan)"},
             max_wire_bytes=MAX_BODY_BYTES,
@@ -1306,6 +1366,7 @@ def _scan_wave(
     indexes: list[int],
     scan_fn: Callable[[dict[str, object]], dict[str, object]],
     workers: int,
+    on_interrupt: Callable[[], None] | None = None,
 ) -> dict[int, dict[str, object]]:
     completed: dict[int, dict[str, object]] = {}
     executor = ThreadPoolExecutor(max_workers=workers)
@@ -1324,6 +1385,10 @@ def _scan_wave(
                     f"snapshot scan failed: {exc}",
                 )
     except KeyboardInterrupt:
+        # Tell running workers to stop retrying before we wait on them;
+        # shutdown() joins them, so a pending backoff would hold up Ctrl-C.
+        if on_interrupt is not None:
+            on_interrupt()
         for future in futures:
             future.cancel()
         executor.shutdown(wait=True, cancel_futures=True)
@@ -1338,6 +1403,7 @@ def scan_history(
     *,
     full: bool,
     workers: int,
+    on_interrupt: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     count = len(snapshots)
     if count == 0:
@@ -1374,6 +1440,7 @@ def scan_history(
                 wave,
                 scan_fn,
                 workers,
+                on_interrupt,
             )
         )
         if full:
@@ -1904,6 +1971,7 @@ def run_cli(
             ),
             full=args.full_scan,
             workers=workers,
+            on_interrupt=client.cancel,
         )
         document = build_success_document(
             domain,

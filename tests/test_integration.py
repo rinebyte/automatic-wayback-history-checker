@@ -403,8 +403,10 @@ class LocalHttpIntegrationTests(unittest.TestCase):
             b'["20200201000000","404","","http://example.com/"],'
             b'["20200301000000","200","","http://example.com/"]]'
         )
+        # Served gzipped, so it compresses to a few KB on the wire and only
+        # the decoded budget can cut it.
         risky_html = (
-            b"<title>Slot Gacor</title>" + b"x" * 600_001
+            b"<title>Slot Gacor</title>" + b"x" * (wb.MAX_DECODED_BYTES + 1)
         )
         routes = {
             "/cdx": [

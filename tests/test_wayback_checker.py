@@ -311,6 +311,28 @@ class NetworkClientTests(unittest.TestCase):
         self.assertIn("collapse=timestamp%3A6", requested[0][0])
         self.assertEqual(requested[0][1]["attempts"], 3)
 
+    def test_fetch_cdx_decodes_a_compressed_response(self):
+        payload = (
+            b'[["timestamp","statuscode","redirect","original"],'
+            b'["20200101000000","200","","http://example.com/"]]'
+        )
+
+        class GzipClient:
+            def get(self, url, **kwargs):
+                return wb.RawResponse(
+                    200,
+                    {
+                        "content-type": "application/json",
+                        "content-encoding": "gzip",
+                    },
+                    gzip.compress(payload),
+                    False,
+                )
+
+        snapshots, warnings = wb.fetch_cdx(GzipClient(), "example.com")
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(warnings, [])
+
     def test_fetch_cdx_maps_busy_and_invalid_json_to_cdx_error(self):
         class BusyClient:
             def get(self, url, **kwargs):
@@ -324,6 +346,23 @@ class NetworkClientTests(unittest.TestCase):
             wb.fetch_cdx(BusyClient(), "example.com")
         with self.assertRaisesRegex(wb.CdxError, "valid JSON"):
             wb.fetch_cdx(BrokenClient(), "example.com")
+
+    def test_requests_compressed_bodies_rather_than_identity(self):
+        seen = {}
+
+        def attempt(url, *, proxy, timeout, headers, max_wire_bytes):
+            seen.update(headers)
+            return wb.RawResponse(200, {}, b"ok", False)
+
+        client = wb.NetworkClient(
+            attempt_fn=attempt,
+            sleep_fn=lambda seconds: None,
+            random_fn=lambda: 0.0,
+        )
+        client.get("https://example.test/", attempts=1, timeout=5)
+        # Asking for identity made ordinary pages overflow the wire budget
+        # and cost a connection, since a truncated body cannot be reused.
+        self.assertIn("gzip", seen["Accept-Encoding"])
 
     def test_cancel_abandons_the_remaining_attempts(self):
         calls = []
@@ -528,13 +567,13 @@ class BodyDecodingTests(unittest.TestCase):
                     "content-type": "text/plain",
                 },
                 (
-                    gzip.compress(b"a" * 400_000)
-                    + gzip.compress(b"b" * 400_000)
+                    gzip.compress(b"a" * wb.MAX_DECODED_BYTES)
+                    + gzip.compress(b"b" * wb.MAX_DECODED_BYTES)
                 ),
                 False,
             )
         )
-        self.assertEqual(len(capped.text), 600_000)
+        self.assertEqual(len(capped.text), wb.MAX_DECODED_BYTES)
         self.assertTrue(capped.truncated)
 
     def test_caps_decompressed_output_and_marks_truncation(self):
@@ -544,17 +583,17 @@ class BodyDecodingTests(unittest.TestCase):
                 "content-encoding": "gzip",
                 "content-type": "text/plain",
             },
-            gzip.compress(b"x" * 600_001),
+            gzip.compress(b"x" * (wb.MAX_DECODED_BYTES + 1)),
             False,
         )
         decoded = wb.decode_body(response)
-        self.assertEqual(len(decoded.text), 600_000)
+        self.assertEqual(len(decoded.text), wb.MAX_DECODED_BYTES)
         self.assertTrue(decoded.truncated)
         exact = wb.decode_body(
             wb.RawResponse(
                 200,
                 {"content-type": "text/plain"},
-                b"x" * 600_000,
+                b"x" * wb.MAX_WIRE_BYTES,
                 False,
             )
         )
@@ -562,12 +601,48 @@ class BodyDecodingTests(unittest.TestCase):
             wb.RawResponse(
                 200,
                 {"content-type": "text/plain"},
-                b"x" * 600_000,
+                b"x" * wb.MAX_WIRE_BYTES,
                 True,
             )
         )
         self.assertFalse(exact.truncated)
         self.assertTrue(wire_overflow.truncated)
+
+    def test_page_over_the_wire_budget_survives_when_compressed(self):
+        # Shaped after a real capture: ~820 KB of HTML, ~196 KB gzipped.
+        html = b"<title>Big</title>" + b"a" * 820_000
+        packed = gzip.compress(html)
+        self.assertLess(len(packed), wb.MAX_WIRE_BYTES)
+        decoded = wb.decode_body(
+            wb.RawResponse(
+                200,
+                {
+                    "content-encoding": "gzip",
+                    "content-type": "text/html",
+                },
+                packed,
+                False,
+            )
+        )
+        self.assertFalse(decoded.truncated)
+        self.assertEqual(len(decoded.text), len(html))
+
+    def test_decompression_bomb_is_still_bounded(self):
+        packed = gzip.compress(b"\0" * (wb.MAX_DECODED_BYTES * 2))
+        self.assertLess(len(packed), wb.MAX_WIRE_BYTES)
+        decoded = wb.decode_body(
+            wb.RawResponse(
+                200,
+                {
+                    "content-encoding": "gzip",
+                    "content-type": "text/plain",
+                },
+                packed,
+                False,
+            )
+        )
+        self.assertTrue(decoded.truncated)
+        self.assertEqual(len(decoded.text), wb.MAX_DECODED_BYTES)
 
     def test_records_unsupported_encoding_without_failure(self):
         for encoding in ("br", "zstd"):

@@ -265,7 +265,13 @@ CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx"
 REQUIRED_CDX_FIELDS = ("timestamp", "statuscode", "redirect", "original")
 RETRYABLE_STATUSES = {403, 408, 429, 500, 502, 503, 504}
 USER_AGENT = "standalone-wayback-checker/1.0"
-MAX_BODY_BYTES = 600_000
+# Two separate budgets. The wire cap bounds what we download; the decoded cap
+# bounds what we hold and parse, and is what stops a decompression bomb. They
+# used to be one constant, which meant an ordinary 800 KB page was cut to
+# 600 KB — and a cut body also costs a pooled connection, because its unread
+# bytes make the connection unusable.
+MAX_WIRE_BYTES = 1_000_000
+MAX_DECODED_BYTES = 4_000_000
 ANALYZABLE_APPLICATION_TYPES = {
     "application/html",
     "application/javascript",
@@ -768,7 +774,7 @@ class NetworkClient:
     ) -> RawResponse:
         request_headers = {
             "User-Agent": USER_AGENT,
-            "Accept-Encoding": "identity",
+            "Accept-Encoding": "gzip, deflate",
         }
         request_headers.update(headers or {})
         last_error: BaseException | None = None
@@ -880,8 +886,20 @@ def fetch_cdx(
         raise CdxError("Wayback CDX is busy; try again in a moment")
     if not 200 <= response.status < 300:
         raise CdxError(f"Wayback CDX returned HTTP {response.status}")
+    # The index arrives compressed like any other body, so it goes through
+    # the same decoder rather than being read off the wire directly.
     try:
-        data = json.loads(response.body.decode("utf-8"))
+        body, truncated, unsupported = _decode_wire_body(response)
+    except ContentDecodeError as exc:
+        raise CdxError(f"Wayback CDX body could not be decoded: {exc}") from exc
+    if unsupported is not None:
+        raise CdxError(
+            f"Wayback CDX used an unsupported content encoding: {unsupported}"
+        )
+    if truncated:
+        raise CdxError("Wayback CDX response was truncated")
+    try:
+        data = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CdxError("Wayback CDX did not return valid JSON") from exc
     return parse_cdx_data(data)
@@ -912,9 +930,9 @@ def _inflate_limited(
     while True:
         decoder = zlib.decompressobj(wbits)
         try:
-            budget = MAX_BODY_BYTES + 1 - len(output)
+            budget = MAX_DECODED_BYTES + 1 - len(output)
             output.extend(decoder.decompress(pending, budget))
-            remaining = MAX_BODY_BYTES + 1 - len(output)
+            remaining = MAX_DECODED_BYTES + 1 - len(output)
             if remaining > 0:
                 output.extend(decoder.flush(remaining))
         except zlib.error as exc:
@@ -922,12 +940,12 @@ def _inflate_limited(
                 f"compressed body could not be decoded: {exc}"
             ) from exc
         if (
-            len(output) > MAX_BODY_BYTES
+            len(output) > MAX_DECODED_BYTES
             or bool(decoder.unconsumed_tail)
         ):
-            return bytes(output[:MAX_BODY_BYTES]), True
+            return bytes(output[:MAX_DECODED_BYTES]), True
         if not decoder.eof:
-            return bytes(output[:MAX_BODY_BYTES]), True
+            return bytes(output[:MAX_DECODED_BYTES]), True
         if not concatenated or not decoder.unused_data:
             return bytes(output), False
         pending = decoder.unused_data
@@ -940,8 +958,8 @@ def _decode_wire_body(
     wire = response.body
     if encoding in {"", "identity"}:
         return (
-            wire[:MAX_BODY_BYTES],
-            response.wire_truncated or len(wire) > MAX_BODY_BYTES,
+            wire[:MAX_WIRE_BYTES],
+            response.wire_truncated or len(wire) > MAX_WIRE_BYTES,
             None,
         )
     if encoding in {"gzip", "x-gzip"}:
@@ -1345,7 +1363,7 @@ def scan_snapshot(
             attempts=3,
             timeout=timeout,
             headers={"User-Agent": f"{USER_AGENT} (+archive-scan)"},
-            max_wire_bytes=MAX_BODY_BYTES,
+            max_wire_bytes=MAX_WIRE_BYTES,
         )
     except NetworkError as exc:
         return failed_scan_result(snapshot, str(exc))

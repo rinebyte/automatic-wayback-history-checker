@@ -38,6 +38,14 @@ once that budget is spent. A connection per capture is what gets a scan
 refused; measured on a 140-capture domain, a fresh connection per request lost
 20 of 39 captures, while reusing connections lost none.
 
+Bodies are requested compressed and bounded by two separate budgets: 1 MB on
+the wire, and 4 MB once decoded. The wire budget limits what is downloaded, the
+decoded budget limits what is parsed and is what stops a decompression bomb.
+Compression matters for coverage, not just bandwidth: an ordinary 800 KB page
+is about 195 KB gzipped, so it now arrives whole instead of being cut. A cut
+body also costs a connection, because its unread bytes make that connection
+unusable.
+
 Requests start with a direct attempt. The configured proxy is used after a
 retryable status or network failure; after rescuing a request, it is preferred
 for 60 seconds. A proxy also spreads the connection budget across IPs, which
